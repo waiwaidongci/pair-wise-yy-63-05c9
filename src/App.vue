@@ -14,8 +14,11 @@ import {
   SwapIcon
 } from 'tdesign-icons-vue-next';
 import TokenEditor from './components/TokenEditor.vue';
+import SyncCenter from './components/SyncCenter.vue';
+import PublishPipeline from './components/PublishPipeline.vue';
 import { fetchTokens, submitRelease, type Token } from './api';
 import { useTokenStore } from './store';
+import { useSyncStore } from './sync/syncStore';
 
 const AddButtonIcon = () => h(AddIcon);
 const ArrowRightButtonIcon = () => h(ArrowRightIcon);
@@ -29,6 +32,7 @@ const SwapButtonIcon = () => h(SwapIcon);
 const route = useRoute();
 const router = useRouter();
 const store = useTokenStore();
+const sync = useSyncStore();
 const { data: remote } = useQuery({ queryKey: ['tokens'], queryFn: fetchTokens });
 const selectedVersion = ref(store.releaseVersion);
 const batchFrom = ref('');
@@ -40,6 +44,7 @@ const releaseResult = ref('');
 
 const nav = [
   { path: '/', label: '令牌工作区', icon: 'token' },
+  { path: '/sync', label: '品牌包同步', icon: 'cloud-upload' },
   { path: '/graph', label: '依赖与校验', icon: 'control-platform' },
   { path: '/review', label: '变更评审', icon: 'git-commit' },
   { path: '/publish', label: '主题发布', icon: 'send' }
@@ -158,7 +163,7 @@ function publish() {
     <t-layout class="body-layout">
       <t-aside class="side-nav">
         <div class="workspace-card"><t-icon name="layers" /><div><span>当前工作区</span><strong>通用组件库 · 品牌主题</strong><small>15 个令牌 · 4 个主题变体</small></div></div>
-        <nav><button v-for="item in nav" :key="item.path" :class="{ active: route.path === item.path }" @click="go(item.path)"><t-icon :name="item.icon" /><span>{{ item.label }}</span><t-badge v-if="item.path === '/review'" :count="store.changes.filter(c => c.status === '待评审').length" /></button></nav>
+        <nav><button v-for="item in nav" :key="item.path" :class="{ active: route.path === item.path }" @click="go(item.path)"><t-icon :name="item.icon" /><span>{{ item.label }}</span><t-badge v-if="item.path === '/review'" :count="store.changes.filter(c => c.status === '待评审').length" /><t-badge v-else-if="item.path === '/sync'" :count="store.reviewQueue.length + sync.recentConflicts.length" /></button></nav>
         <div class="save-state"><t-icon name="cloud-done" /><div><span>草稿已保存</span><small>{{ new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) }}</small></div></div>
       </t-aside>
       <t-content class="main-content">
@@ -200,6 +205,8 @@ function publish() {
           </aside>
         </section>
 
+        <SyncCenter v-if="route.path === '/sync'" />
+
         <section v-else-if="route.path === '/graph'" class="graph-page panel">
           <div class="panel-head"><div><strong>令牌依赖图</strong><span>基础令牌 → 语义令牌 → 组件别名</span></div><div class="graph-legend"><span><i class="color" />颜色</span><span><i class="component" />组件</span><span><i class="error" />错误</span></div></div>
           <div class="graph-canvas">
@@ -229,24 +236,10 @@ function publish() {
         </section>
 
         <section v-else class="publish-page">
-          <div class="panel publish-main">
-            <div class="panel-head"><div><strong>发布准备</strong><span>生成只读版本，支持回滚到历史基线</span></div><t-tag :theme="store.locked ? 'success' : 'warning'">{{ store.locked ? '已锁定' : '候选版本' }}</t-tag></div>
-            <div class="publish-form">
-              <label><span>版本号</span><t-input v-model="selectedVersion" /></label>
-              <label><span>目标产品</span><t-select multiple value="['组件库','运营后台','移动端组件']" :options="[{label:'组件库',value:'组件库'},{label:'运营后台',value:'运营后台'},{label:'移动端组件',value:'移动端组件'},{label:'数据平台',value:'数据平台'}]" /></label>
-              <label><span>发布说明</span><t-textarea value="更新语义主色、统一控件圆角，并修复暗色主题正文对比度。" :autosize="{ minRows: 3 }" /></label>
-            </div>
-            <div class="release-checks">
-              <label><t-checkbox checked /> 循环依赖检查通过</label>
-              <label><t-checkbox checked /> 无效引用检查通过</label>
-              <label><t-checkbox :checked="store.contrastIssues.length === 0" /> 颜色对比度符合 WCAG AA</label>
-              <label><t-checkbox :checked="store.changes.every(c => c.status !== '待评审')" /> 所有变更请求已处理</label>
-            </div>
-            <div class="publish-actions"><t-button variant="outline" @click="store.rollback">回滚全部未发布编辑</t-button><t-button theme="primary" icon="lock-on" :disabled="store.locked || store.changes.some(c => c.status === '待评审')" @click="publish">校验并锁定发布</t-button></div>
-          </div>
+          <PublishPipeline />
           <aside class="publish-side">
             <div class="panel diff-panel"><div class="panel-head"><div><strong>版本差异</strong><span>相对 {{ store.lastPublished }}</span></div><t-tag>{{ store.diffRows.length }} 项</t-tag></div><div v-for="row in store.diffRows" :key="row.id" class="diff-row"><strong>{{ row.name }}</strong><span>{{ row.id }}</span><div><del>{{ row.before }}</del><ins>{{ row.after }}</ins></div></div><p v-if="!store.diffRows.length" class="empty">暂无未发布差异。</p></div>
-            <div class="panel history-panel"><div class="panel-head"><div><strong>发布历史</strong><span>可追溯版本</span></div><HistoryIcon /></div><div class="history-row"><t-tag theme="success" variant="light">当前</t-tag><div><strong>DS {{ store.lastPublished }}</strong><span>顾清 · 09-24 17:20</span></div><t-button size="small" variant="text">查看</t-button></div><div class="history-row"><t-tag>历史</t-tag><div><strong>DS 4.5.1</strong><span>周序 · 09-12 11:04</span></div><t-button size="small" variant="text">回滚</t-button></div><div class="history-row"><t-tag>历史</t-tag><div><strong>DS 4.5.0</strong><span>顾清 · 08-28 15:42</span></div><t-button size="small" variant="text">回滚</t-button></div></div>
+            <div class="panel history-panel"><div class="panel-head"><div><strong>发布历史</strong><span>可追溯快照</span></div><HistoryIcon /></div><div v-for="snap in sync.snapshots" :key="snap.snapshotId" class="history-row"><t-tag theme="success" variant="light">快照</t-tag><div><strong>{{ snap.version }}</strong><span>{{ snap.snapshotId }} · {{ snap.themes.join('/') }}</span></div></div><div class="history-row"><t-tag>历史</t-tag><div><strong>DS 4.5.2</strong><span>顾清 · 09-24 17:20</span></div><t-button size="small" variant="text">查看</t-button></div><div class="history-row"><t-tag>历史</t-tag><div><strong>DS 4.5.1</strong><span>周序 · 09-12 11:04</span></div><t-button size="small" variant="text">回滚</t-button></div></div>
           </aside>
         </section>
       </t-content>

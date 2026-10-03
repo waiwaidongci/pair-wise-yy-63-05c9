@@ -1,4 +1,5 @@
 import { defineStore } from 'pinia';
+import type { Provenance } from './sync/engine';
 
 export type TokenCategory = 'color' | 'font' | 'spacing' | 'radius' | 'shadow' | 'component';
 export type Token = {
@@ -8,6 +9,8 @@ export type Token = {
   value: string;
   ref?: string;
   themes: Record<string, string>;
+  /** 各主题来源溯源：外部包版本、品牌覆盖与待复核标记 */
+  provenance?: Record<string, Provenance>;
   usage: number;
   status: 'stable' | 'deprecated' | 'proposed';
   description: string;
@@ -68,6 +71,33 @@ export const useTokenStore = defineStore('tokens', {
     selectedToken(state): Token | undefined {
       return state.tokens.find((token) => token.id === state.selectedTokenId);
     },
+    reviewQueue(state) {
+      const rows: { token: Token; theme: string; sourceVersion?: string }[] = [];
+      state.tokens.forEach((token) => {
+        const map = token.provenance ?? {};
+        Object.keys(map).forEach((theme) => {
+          if (map[theme].needsReview) rows.push({ token, theme, sourceVersion: map[theme].sourceVersion });
+        });
+      });
+      return rows;
+    },
+    /** 在某主题下沿引用链解析令牌，返回字面值与完整链路（供快照与校验复用）。 */
+    resolveInTheme: (state) => (theme: string, id: string) => resolveInTokens(state.tokens, theme, id),
+    /** 当前主题下每类关键前景/背景的对比度（AA 门禁）。 */
+    themeContrast:
+      (state) =>
+      (theme: string): { label: string; ratio: number | null; pass: boolean }[] => {
+      const pairs: [string, string, string][] = [
+        ['color.text.primary', 'color.surface.canvas', '正文 / 页面背景'],
+        ['component.button.primary.bg', 'component.button.primary.text', '主按钮背景 / 文字']
+      ];
+      return pairs.map(([fgId, bgId, label]) => {
+        const fg = resolveInTokens(state.tokens, theme, fgId);
+        const bg = resolveInTokens(state.tokens, theme, bgId);
+        const ratio = fg.literal && bg.literal ? contrastRatio(fg.literal, bg.literal) : null;
+        return { label, ratio, pass: ratio === null || ratio >= 4.5 };
+      });
+    },
     filteredTokens(state): Token[] {
       const query = state.search.toLowerCase();
       return state.tokens.filter((token) => {
@@ -99,12 +129,11 @@ export const useTokenStore = defineStore('tokens', {
       return state.tokens.filter((token) => token.ref && !ids.has(token.ref));
     },
     contrastIssues(state) {
-      const text = state.tokens.find((token) => token.id === 'color.text.primary');
-      const surface = state.tokens.find((token) => token.id === 'color.surface.canvas');
-      const values = [text?.themes[state.activeTheme], surface?.themes[state.activeTheme]].filter(Boolean) as string[];
-      if (values.length < 2) return [];
-      const ratio = contrastRatio(values[0], values[1]);
-      return ratio < 4.5 ? [{ title: '正文与页面背景对比度不足', detail: `当前 ${ratio.toFixed(2)}:1，要求至少 4.5:1。` }] : [];
+      const text = resolveInTokens(state.tokens, state.activeTheme, 'color.text.primary');
+      const surface = resolveInTokens(state.tokens, state.activeTheme, 'color.surface.canvas');
+      if (!text.literal || !surface.literal) return [];
+      const ratio = contrastRatio(text.literal, surface.literal);
+      return ratio !== null && ratio < 4.5 ? [{ title: '正文与页面背景对比度不足', detail: `当前 ${ratio.toFixed(2)}:1，要求至少 4.5:1。` }] : [];
     },
     diffRows(state) {
       return state.tokens.filter((token) => {
@@ -176,6 +205,29 @@ export const useTokenStore = defineStore('tokens', {
     }
   }
 });
+
+function resolveInTokens(tokens: Token[], theme: string, id: string): { literal: string | null; chain: string[]; error?: 'unresolved' | 'cycle' } {
+  const refOf = (value: string | undefined): string | null => {
+    if (!value) return null;
+    const match = value.trim().match(/^\{([^{}]+)\}$/);
+    return match ? match[1].trim() : null;
+  };
+  const rawOf = (tokenId: string) => {
+    const token = tokens.find((item) => item.id === tokenId);
+    return token ? (token.themes[theme] ?? token.value) : undefined;
+  };
+  const chain: string[] = [];
+  let current = id;
+  for (;;) {
+    if (chain.includes(current)) return { literal: null, chain: [...chain, current], error: 'cycle' };
+    chain.push(current);
+    const raw = rawOf(current);
+    if (raw === undefined) return { literal: null, chain, error: 'unresolved' };
+    const ref = refOf(raw);
+    if (!ref) return { literal: raw.trim(), chain };
+    current = ref;
+  }
+}
 
 function contrastRatio(a: string, b: string) {
   const luminance = (hex: string) => {
