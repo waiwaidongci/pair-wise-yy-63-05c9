@@ -1,4 +1,20 @@
 import { defineStore } from 'pinia';
+import {
+  buildSnapshot,
+  contrastRatio,
+  inferKind,
+  mergePackage,
+  packageKey,
+  recomputeDependents,
+  reduceToConflicts,
+  THEME_NAMES,
+  validatePackage,
+  type ConflictItem,
+  type PackageRecord,
+  type Snapshot,
+  type ThemePackage,
+  type TxRecord
+} from './themeSync';
 
 export type TokenCategory = 'color' | 'font' | 'spacing' | 'radius' | 'shadow' | 'component';
 export type Token = {
@@ -11,6 +27,10 @@ export type Token = {
   usage: number;
   status: 'stable' | 'deprecated' | 'proposed';
   description: string;
+  kind?: 'base' | 'semantic' | 'component';
+  sourceVersion?: string;
+  overrides?: Record<string, boolean>;
+  reviewStatus?: 'ok' | 'pending';
 };
 
 export type ChangeRequest = {
@@ -51,9 +71,18 @@ const storageKey = 'yy63-token-governance';
 const raw = typeof localStorage !== 'undefined' ? localStorage.getItem(storageKey) : null;
 const saved = raw ? JSON.parse(raw) : null;
 
+function normalize(tokens: Token[]): Token[] {
+  return tokens.map((token) => ({
+    ...token,
+    kind: token.kind ?? inferKind(token.id),
+    reviewStatus: token.reviewStatus ?? 'ok',
+    overrides: token.overrides ?? {}
+  }));
+}
+
 export const useTokenStore = defineStore('tokens', {
   state: () => ({
-    tokens: (saved?.tokens as Token[]) ?? initialTokens,
+    tokens: normalize(saved?.tokens as Token[] ?? initialTokens),
     changes: (saved?.changes as ChangeRequest[]) ?? changes,
     activeTheme: (saved?.activeTheme as string) ?? 'light',
     selectedTokenId: (saved?.selectedTokenId as string) ?? 'color.semantic.primary',
@@ -62,7 +91,13 @@ export const useTokenStore = defineStore('tokens', {
     releaseVersion: '4.6.0-rc.2',
     locked: (saved?.locked as boolean) ?? false,
     lastPublished: (saved?.lastPublished as string) ?? 'DS 4.5.2',
-    baseline: initialTokens.map((token) => ({ id: token.id, value: token.value }))
+    baseline: initialTokens.map((token) => ({ id: token.id, value: token.value })),
+    // 主题包增量同步
+    packages: (saved?.packages as PackageRecord[]) ?? [],
+    transactions: (saved?.transactions as TxRecord[]) ?? [],
+    snapshots: (saved?.snapshots as Snapshot[]) ?? [],
+    importError: '' as string,
+    importInfo: '' as string
   }),
   getters: {
     selectedToken(state): Token | undefined {
@@ -118,6 +153,18 @@ export const useTokenStore = defineStore('tokens', {
     releaseReadiness(state): number {
       const base = 100 - this.cycleNodes.length * 25 - this.invalidReferences.length * 20 - this.contrastIssues.length * 15;
       return Math.max(0, base);
+    },
+    pendingTransactions(state): TxRecord[] {
+      return state.transactions.filter((tx) => tx.status === 'pending');
+    },
+    failedTransactions(state): TxRecord[] {
+      return state.transactions.filter((tx) => tx.status === 'failed');
+    },
+    pendingReviewTokens(state): Token[] {
+      return state.tokens.filter((token) => token.reviewStatus === 'pending');
+    },
+    latestSnapshot(state): Snapshot | undefined {
+      return state.snapshots[0];
     }
   },
   actions: {
@@ -128,10 +175,21 @@ export const useTokenStore = defineStore('tokens', {
     updateTokenValue(id: string, value: string) {
       const token = this.tokens.find((item) => item.id === id);
       if (!token) return;
+      const wasRef = !!token.ref;
       token.value = value;
       token.themes[this.activeTheme] = value;
       if (value.startsWith('{') && value.endsWith('}')) token.ref = value.slice(1, -1);
       else delete token.ref;
+
+      // 别名被显式改成字面量 → 品牌覆盖，标记待复核
+      if (wasRef && !value.startsWith('{') && token.kind !== 'base') {
+        token.overrides = { ...(token.overrides ?? {}), [this.activeTheme]: true };
+        token.reviewStatus = 'pending';
+      }
+
+      // 基础令牌改动后：未覆盖的别名重算，品牌覆盖保留但待复核
+      const result = recomputeDependents(this.tokens, id, this.activeTheme);
+      this.tokens = result.tokens;
       this.persist();
     },
     addToken(token: Token) {
@@ -171,20 +229,181 @@ export const useTokenStore = defineStore('tokens', {
       }
       this.persist();
     },
+
+    // ---- 主题包增量同步 ----
+
+    nextSeq(): number {
+      return this.transactions.length ? Math.max(...this.transactions.map((tx) => tx.seq)) + 1 : 1;
+    },
+
+    commitPackage(tx: TxRecord) {
+      this.tokens = mergePackage(this.tokens, tx.pkg);
+      tx.status = 'committed';
+      tx.lastError = undefined;
+      const key = packageKey(tx.pkg);
+      if (!this.packages.some((pkg) => pkg.key === key)) {
+        this.packages.push({
+          key,
+          packageId: tx.packageId,
+          version: tx.version,
+          actor: tx.actor,
+          submittedAt: tx.submittedAt,
+          tokenCount: tx.pkg.tokens.length,
+          outcome: 'committed',
+          seq: tx.seq
+        });
+      }
+    },
+
+    // 导入主题包：先校验（引用解析 + 对比度门禁），通过后整包写入。
+    // 重复来源版本沿用第一次结果，不重复写入。
+    importThemePackage(pkg: ThemePackage, opts: { simulateWriteFailure?: boolean } = {}): { ok: boolean; deduped?: boolean; recoverable?: boolean; seq?: number; errors?: string[] } {
+      this.importError = '';
+      this.importInfo = '';
+      const key = packageKey(pkg);
+      const existing = this.packages.find((item) => item.key === key);
+      if (existing) {
+        this.importInfo = `包 ${key} 已导入（包号 #${existing.seq}），沿用第一次结果，本次不重复写入。`;
+        return { ok: true, deduped: true };
+      }
+
+      const seq = this.nextSeq();
+      const tx: TxRecord = {
+        seq,
+        packageId: pkg.packageId,
+        version: pkg.version,
+        actor: pkg.actor,
+        submittedAt: pkg.submittedAt,
+        status: 'pending',
+        attempts: 0,
+        simulateWriteFailure: opts.simulateWriteFailure,
+        pkg
+      };
+      this.transactions.push(tx);
+      this.persist();
+
+      const validation = validatePackage(this.tokens, pkg);
+      if (!validation.ok) {
+        tx.status = 'failed';
+        tx.attempts = 1;
+        tx.lastError = validation.errors.join('；');
+        this.importError = tx.lastError;
+        this.packages.push({
+          key, packageId: pkg.packageId, version: pkg.version, actor: pkg.actor,
+          submittedAt: pkg.submittedAt, tokenCount: pkg.tokens.length,
+          outcome: 'rejected', reason: tx.lastError, seq
+        });
+        this.persist();
+        return { ok: false, errors: validation.errors };
+      }
+
+      tx.attempts += 1;
+      if (opts.simulateWriteFailure) {
+        tx.lastError = '模拟写入失败：本地存储写入中断，事务保持待恢复状态';
+        this.importError = tx.lastError;
+        this.persist();
+        return { ok: false, recoverable: true, seq };
+      }
+
+      this.commitPackage(tx);
+      this.importInfo = `包 ${key} 已提交（包号 #${seq}），写入 ${pkg.tokens.length} 个令牌。`;
+      this.persist();
+      return { ok: true, seq };
+    },
+
+    // 写入失败后按包号恢复：重开后对待恢复事务重新校验并补写入。
+    recoverTransaction(seq: number): { ok: boolean; errors?: string[] } {
+      const tx = this.transactions.find((item) => item.seq === seq);
+      if (!tx || tx.status !== 'pending') return { ok: false };
+      tx.attempts += 1;
+      const validation = validatePackage(this.tokens, tx.pkg);
+      if (!validation.ok) {
+        tx.status = 'failed';
+        tx.lastError = validation.errors.join('；');
+        this.importError = tx.lastError;
+        this.persist();
+        return { ok: false, errors: validation.errors };
+      }
+      this.commitPackage(tx);
+      this.importInfo = `包号 #${seq} 恢复成功，已补写入 ${tx.pkg.tokens.length} 个令牌。`;
+      this.persist();
+      return { ok: true };
+    },
+
+    // 并发提交：先到者生效，后到者只留下冲突项。
+    submitConcurrent(first: ThemePackage, later: ThemePackage): { conflicts: ConflictItem[] } {
+      this.importError = '';
+      this.importInfo = '';
+      this.importThemePackage(first);
+      const conflicts = reduceToConflicts(this.tokens, later);
+      const seq = this.nextSeq();
+      const tx: TxRecord = {
+        seq,
+        packageId: later.packageId,
+        version: later.version,
+        actor: later.actor,
+        submittedAt: later.submittedAt,
+        status: 'pending',
+        attempts: 0,
+        pkg: later,
+        conflicts
+      };
+      this.transactions.push(tx);
+      this.importInfo = `并发提交：先到包 ${packageKey(first)} 已生效；后到包 ${packageKey(later)} 保留 ${conflicts.length} 个冲突项待处理。`;
+      this.persist();
+      return { conflicts };
+    },
+
+    // 接受/拒绝后到包留下的冲突项。
+    resolveConflict(seq: number, item: ConflictItem, accept: boolean) {
+      const tx = this.transactions.find((txItem) => txItem.seq === seq);
+      if (!tx || !tx.conflicts) return;
+      if (accept) {
+        const token = this.tokens.find((tokenItem) => tokenItem.id === item.tokenId);
+        if (token) {
+          token.themes[item.theme] = item.incoming;
+          if (item.theme === 'light') token.value = item.incoming;
+          token.sourceVersion = `${tx.packageId}@${tx.version}`;
+        }
+      }
+      tx.conflicts = tx.conflicts.filter((conflict) => !(conflict.tokenId === item.tokenId && conflict.theme === item.theme));
+      this.persist();
+    },
+
+    // 发布快照：各主题最终值与引用链。
+    publishSnapshot(): Snapshot {
+      const snapshot = buildSnapshot(this.tokens, this.releaseVersion);
+      this.snapshots.unshift(snapshot);
+      this.persist();
+      return snapshot;
+    },
+
+    clearReview(tokenId: string) {
+      const token = this.tokens.find((item) => item.id === tokenId);
+      if (token) {
+        token.reviewStatus = 'ok';
+        this.persist();
+      }
+    },
+
     persist() {
-      if (typeof localStorage !== 'undefined') localStorage.setItem(storageKey, JSON.stringify({ tokens: this.tokens, changes: this.changes, activeTheme: this.activeTheme, selectedTokenId: this.selectedTokenId, search: this.search, category: this.category, locked: this.locked, lastPublished: this.lastPublished }));
+      if (typeof localStorage !== 'undefined') {
+        localStorage.setItem(storageKey, JSON.stringify({
+          tokens: this.tokens,
+          changes: this.changes,
+          activeTheme: this.activeTheme,
+          selectedTokenId: this.selectedTokenId,
+          search: this.search,
+          category: this.category,
+          locked: this.locked,
+          lastPublished: this.lastPublished,
+          packages: this.packages,
+          transactions: this.transactions,
+          snapshots: this.snapshots
+        }));
+      }
     }
   }
 });
 
-function contrastRatio(a: string, b: string) {
-  const luminance = (hex: string) => {
-    const clean = hex.replace('#', '');
-    if (clean.length !== 6) return .5;
-    const channels = [0, 2, 4].map((index) => parseInt(clean.slice(index, index + 2), 16) / 255).map((value) => value <= .03928 ? value / 12.92 : ((value + .055) / 1.055) ** 2.4);
-    return .2126 * channels[0] + .7152 * channels[1] + .0722 * channels[2];
-  };
-  const l1 = luminance(a);
-  const l2 = luminance(b);
-  return (Math.max(l1, l2) + .05) / (Math.min(l1, l2) + .05);
-}
+export { THEME_NAMES };

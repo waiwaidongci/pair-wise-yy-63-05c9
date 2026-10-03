@@ -155,6 +155,10 @@ button, input, textarea { font: inherit; }
 .history-row strong { font-size: 11px; }
 .history-row span { color: var(--muted); font-size: 8.5px; margin-top: 4px; }
 .empty { color: var(--muted); font-size: 10px; padding: 12px; }
+
+.review-dot { display: inline-block; width: 7px; height: 7px; margin-left: 6px; border-radius: 50%; background: #e0a12e; vertical-align: middle; }
+.src-ver { display: block; font-size: 7.5px; color: #9aa7b2; margin-top: 2px; font-family: ui-monospace, monospace; }
+.packages-page { min-height: calc(100vh - 180px); }
 .dialog-form { display: grid; gap: 12px; }
 .release-success { text-align: center; padding: 18px; }
 .release-success h3 { margin: 12px 0 6px; }

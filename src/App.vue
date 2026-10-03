@@ -14,6 +14,7 @@ import {
   SwapIcon
 } from 'tdesign-icons-vue-next';
 import TokenEditor from './components/TokenEditor.vue';
+import ThemeSync from './components/ThemeSync.vue';
 import { fetchTokens, submitRelease, type Token } from './api';
 import { useTokenStore } from './store';
 
@@ -41,6 +42,7 @@ const releaseResult = ref('');
 const nav = [
   { path: '/', label: '令牌工作区', icon: 'token' },
   { path: '/graph', label: '依赖与校验', icon: 'control-platform' },
+  { path: '/packages', label: '主题包同步', icon: 'refresh' },
   { path: '/review', label: '变更评审', icon: 'git-commit' },
   { path: '/publish', label: '主题发布', icon: 'send' }
 ];
@@ -158,7 +160,7 @@ function publish() {
     <t-layout class="body-layout">
       <t-aside class="side-nav">
         <div class="workspace-card"><t-icon name="layers" /><div><span>当前工作区</span><strong>通用组件库 · 品牌主题</strong><small>15 个令牌 · 4 个主题变体</small></div></div>
-        <nav><button v-for="item in nav" :key="item.path" :class="{ active: route.path === item.path }" @click="go(item.path)"><t-icon :name="item.icon" /><span>{{ item.label }}</span><t-badge v-if="item.path === '/review'" :count="store.changes.filter(c => c.status === '待评审').length" /></button></nav>
+        <nav><button v-for="item in nav" :key="item.path" :class="{ active: route.path === item.path }" @click="go(item.path)"><t-icon :name="item.icon" /><span>{{ item.label }}</span><t-badge v-if="item.path === '/review'" :count="store.changes.filter(c => c.status === '待评审').length" /><t-badge v-else-if="item.path === '/packages'" :count="store.pendingReviewTokens.length + store.pendingTransactions.length" /></button></nav>
         <div class="save-state"><t-icon name="cloud-done" /><div><span>草稿已保存</span><small>{{ new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) }}</small></div></div>
       </t-aside>
       <t-content class="main-content">
@@ -175,7 +177,7 @@ function publish() {
             <div class="tree-list">
               <button v-for="token in store.filteredTokens" :key="token.id" :class="{ active: store.selectedTokenId === token.id }" @click="store.selectToken(token.id)">
                 <i :class="token.category" />
-                <div><strong>{{ token.name }}</strong><span>{{ token.id }}</span></div>
+                <div><strong>{{ token.name }}<em v-if="token.reviewStatus === 'pending'" class="review-dot" title="品牌覆盖待复核" /></strong><span>{{ token.id }}</span><span v-if="token.sourceVersion" class="src-ver">{{ token.sourceVersion }}</span></div>
                 <t-tag size="small" :theme="token.status === 'stable' ? 'success' : token.status === 'proposed' ? 'warning' : 'default'" variant="light">{{ token.status === 'stable' ? '稳定' : token.status === 'proposed' ? '候选' : '弃用' }}</t-tag>
               </button>
             </div>
@@ -214,6 +216,10 @@ function publish() {
             </svg>
           </div>
           <div class="validation-strip"><div class="validation-card"><t-icon name="check-circle" theme="success" /><div><strong>循环依赖</strong><span>{{ store.cycleNodes.length ? store.cycleNodes.join(' → ') : '未发现循环引用路径' }}</span></div></div><div class="validation-card"><t-icon :name="store.invalidReferences.length ? 'error-circle' : 'check-circle'" :theme="store.invalidReferences.length ? 'danger' : 'success'" /><div><strong>引用完整性</strong><span>{{ store.invalidReferences.length ? store.invalidReferences.map(t => t.ref).join('、') : '所有引用均指向已发布令牌' }}</span></div></div><div class="validation-card"><t-icon :name="store.contrastIssues.length ? 'error-circle' : 'check-circle'" :theme="store.contrastIssues.length ? 'danger' : 'success'" /><div><strong>对比度检查</strong><span>{{ store.contrastIssues[0]?.detail ?? '正文与背景对比度 13.8:1' }}</span></div></div></div>
+        </section>
+
+        <section v-else-if="route.path === '/packages'" class="packages-page">
+          <ThemeSync />
         </section>
 
         <section v-else-if="route.path === '/review'" class="review-page">
